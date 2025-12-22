@@ -16,8 +16,8 @@ Snowflake usa una arquitectura nueva construida específicamente para la nube, d
 
 **Arquitectura de Snowflake:** Multi-cluster Shared Data con tres capas físicamente separadas pero lógicamente integradas:
 
-1. **Storage Layer** (amarillo): Almacenamiento centralizado en la nube con todos los datos de tablas, similar a shared-disk.
-Profundizando más en la storage layer: 
+1. **Storage Layer** : Almacenamiento centralizado en la nube con todos los datos de tablas, similar a shared-disk.
+**Profundizando más en la storage layer**: 
 La storage layer es el blob storage del cloud provider donde está deployada tu cuenta (S3 en AWS, Azure Blob en Azure, GCS en GCP). Heredamos la escalabilidad casi infinita, disponibilidad y durabilidad del proveedor. Por ejemplo, S3 replica datos en tres availability zones físicamente separadas.
 
 Los datos se organizan en databases, schemas y tables. Snowflake soporta archivos estructurados (CSV, TSV) y semi-estructurados (JSON, Avro, Parquet). Al cargar datos, Snowflake los reorganiza transparentemente a su **formato columnar propietario**, que permite read optimization (saltar columnas no necesarias en queries OLAP). Los archivos se comprimen automáticamente (más eficiente en columnar) y se encriptan por defecto con AES-256.
@@ -26,8 +26,19 @@ Los datos se dividen en **micro-partitions** para que Snowflake ignore particion
 
 **Billing:** Tarifa plana por TB/mes de datos almacenados, calculado a fin de mes.
 
-3. **Query Processing Layer**: Múltiples compute clusters llamados Virtual Warehouses, ejecutan queries, tienen acceso consistente al storage y cachean datos localmente, similar a shared-nothing.
-4. **Cloud Services Layer**: Coordina todo - autenticación, infraestructura, optimización de queries.
+2. **Query Processing Layer**: Múltiples compute clusters llamados Virtual Warehouses, ejecutan queries, tienen acceso consistente al storage y cachean datos localmente, similar a shared-nothing.
+**Profundizando más en la compute o query processing layer**:
+Realiza las tareas de procesamiento sobre los datos del storage layer para responder queries. Consiste en **Virtual Warehouses** (VWs): clusters de compute gestionados por Snowflake que se crean vía SQL. Son abstracciones sobre instancias cloud (EC2 en AWS) que ejecutan el motor de ejecución de Snowflake. Como es SaaS, no tenemos acceso directo a los nodos, solo interactuamos con el objeto warehouse.
+
+Los VWs funcionan similar a shared-nothing: hacen llamadas remotas al storage layer y cachean los datos en almacenamiento local de alta velocidad para queries subsecuentes. Son **ephemeral y flexibles**: se crean/dropean instantáneamente, pueden pausarse (sin cobro en pausa) y resumirse. Esto permite ajustar compute a la demanda real en lugar de provisionar para capacidad pico.
+
+**Ventajas clave:** Múltiples VWs permiten scale-out para workloads concurrentes y **workload isolation** (un VW para data loading, otro para analytics, sin contención de recursos). Cada VW puede tener su propia configuración.
+
+**Tamaños:** Extra Small a 6XL, indicando poder de compute (número y capacidad de instancias). Permite scale-up individual según requisitos del workload.
+
+Todos los VWs tienen acceso a los mismos datos en storage layer simultáneamente. Snowflake usa **procesamiento ACID estricto** (no eventually consistent) mediante el Transaction Manager en Cloud Services Layer, que sincroniza accesos para que todos los updates/inserts estén inmediatamente disponibles para todos los VWs.
+
+3. **Cloud Services Layer**: Coordina todo - autenticación, infraestructura, optimización de queries.
 
 **Ventajas clave:** Storage y compute **desacoplados** (se escalan independientemente), sin límites duros de escalabilidad, múltiples clusters aislados (workload isolation - analytics y ETL no compiten por recursos). Arquitectura service-oriented donde cada capa es un servicio físico separado comunicándose vía REST.
 
