@@ -39,6 +39,20 @@ Los VWs funcionan similar a shared-nothing: hacen llamadas remotas al storage la
 Todos los VWs tienen acceso a los mismos datos en storage layer simultáneamente. Snowflake usa **procesamiento ACID estricto** (no eventually consistent) mediante el Transaction Manager en Cloud Services Layer, que sincroniza accesos para que todos los updates/inserts estén inmediatamente disponibles para todos los VWs.
 
 3. **Cloud Services Layer**: Coordina todo - autenticación, infraestructura, optimización de queries.
+**Porfundizando más en la service layer**
+Colección de servicios altamente disponibles y escalables que coordinan actividades across todas las cuentas Snowflake para procesar requests de usuarios. No se explora profundamente en la documentación porque es SaaS (no necesitamos entender los internals). Usa un modelo **global multi-tenancy** en lugar de crear servicios específicos por cuenta, logrando economías de escala y simplificando features como secure data sharing.
+
+**Servicios principales:**
+- **Authentication & Access Control:** Verifica identidad, credenciales y privilegios para acciones.
+- **Infrastructure Management:** Crea y gestiona recursos cloud subyacentes (blob storage, compute instances).
+- **Transaction Management:** Garantiza ACID compliance y acceso consistente de datos por todos los VWs.
+- **Metadata Management:** Mantiene información y estadísticas sobre objetos y datos (metadata cache).
+- **Query Parsing & Optimization:** Convierte SQL queries en planes ejecutables para VWs.
+- **Security:** Maneja encriptación de datos y rotación de keys.
+
+Corre en instancias cloud como los VWs, pero sin control ni visibilidad del usuario.
+
+**Resumen de la Multi-Cluster Shared Data Architecture**
 
 **Ventajas clave:** Storage y compute **desacoplados** (se escalan independientemente), sin límites duros de escalabilidad, múltiples clusters aislados (workload isolation - analytics y ETL no compiten por recursos). Arquitectura service-oriented donde cada capa es un servicio físico separado comunicándose vía REST.
 
