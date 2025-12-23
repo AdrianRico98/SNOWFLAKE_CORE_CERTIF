@@ -158,3 +158,85 @@ Requiere **API_INTEGRATION object** con información para autenticarse con cloud
 
 **Limitaciones external functions:** Query optimizer no puede ver código remoto (menos optimizaciones, ejecución más lenta). Latencia por ser remotas. Solo scalar (no tabular). No se pueden compartir vía secure data sharing. Potenciales security concerns (librerías third-party podrían almacenar datos sensibles fuera). Posibles charges por data movement entre cloud platforms/regions.
 
+### Stored Procedures
+
+Colecciones nombradas de SQL statements que pueden combinarse con lógica procedural para bundlear/modularizar queries comúnmente ejecutadas que realizan tareas administrativas. En Snowflake, son database objects creados en un database y schema específicos.
+
+**Tres métodos de implementación:**
+- JavaScript
+- Snowflake Scripting (SQL con soporte para lógica procedural)
+- Snowpark (Python, Java, Scala)
+
+**Componentes (JavaScript method):**
+- **Signature:** Identifier y parámetros de input (cero o más)
+- **Return type:** Obligatorio especificarlo, pero opcional retornar valor en el código. Común no retornar nada o solo warning/error code. JavaScript stored procedures solo retornan scalar values, Snowflake Scripting (`LANGUAGE SQL`) puede retornar tabular data
+- **Privilege model único:** Ejecuta con privilegios del role que creó el procedure (owner's rights) o del role que lo ejecuta (caller's rights)
+- **Body:** Delimitado por `$$`, contiene código JavaScript con branching, looping, error handling
+
+**Feature única de Snowflake:** Pueden mezclar JavaScript y SQL en su definition. Se crean SQL commands dinámicamente en variables JavaScript y se ejecutan usando Snowflake's JavaScript API (objeto Snowflake in-built). Resultados pueden almacenarse en variables y loopearse.
+
+**Invocación:** Usando keyword `CALL` como statement independiente, no como parte de otro statement. Un single executable statement solo puede llamar un stored procedure.
+
+**Diferencias vs UDFs:**
+- Solo UDFs pueden llamarse como parte de SQL statement (ej: en SELECT)
+- Ambos pueden overloadearse y tomar cero o más input arguments
+- Procedures usan JavaScript API (mezclan SQL y JavaScript), UDFs no
+- Procedures no necesariamente retornan valor, UDFs siempre retornan
+- Valor retornado por procedure no puede usarse directamente en SQL (ej: guardar en SQL variable)
+- No todos los UDFs soportan recursividad, procedures sí
+
+**Filosofía:** Stored procedures para **realizar acciones** (DML: update, delete, truncate) más que retornar valores. UDFs para **calcular algo y retornar valor** al usuario.
+
+### Sequences
+
+Schema-level object usado para generar números secuenciales y únicos automáticamente. Caso de uso común: incrementar employee IDs o transaction IDs cuando se añade una fila a una tabla.
+
+**Parámetros opcionales:**
+- **START:** Integer desde el cual empezar a producir valores (default: 1)
+- **INCREMENT:** Cuánto subir/bajar cada vez (default: 1, puede ser negativo)
+
+**Uso:** Acceder a valores con `sequence_name.NEXTVAL`. Valores son **globally unique** (dos queries simultáneas no retornan el mismo número).
+
+**Comportamiento con múltiples calls:** En Snowflake, múltiples `NEXTVAL` en una expresión incrementan across columnas (no retornan mismo número). Gotcha: si reruneamos query con múltiples `NEXTVAL`, el increment se multiplica por número de operaciones nextval, causando gaps. Snowflake advierte que sequences **no garantizan valores gap-free**.
+
+**Usos comunes:**
+1. Insert directo: `INSERT INTO table VALUES (seq.NEXTVAL, ...)`
+2. **Default value para columna** (más común): `CREATE TABLE ... (id INT DEFAULT seq.NEXTVAL, ...)`
+
+### Tasks
+
+Objeto para **schedule ejecución** de SQL statement, stored procedure o lógica procedural (Snowflake Scripting). Casos de uso: copiar datos periódicamente, routines de mantenimiento (limpiar tablas antiguas), poblar reporting tables.
+
+**Requisitos:** Rol ACCOUNTADMIN o custom role con privilege `CREATE TASK`.
+
+**Configuración CREATE TASK:**
+- Task identifier (único en schema)
+- Virtual warehouse para ejecución (opcional: usar Snowflake-managed compute serverless, pero con limitaciones como no ejecutar SQL con Python/Java UDFs)
+- **Triggering mechanism:** Intervalo en minutos, CRON expression, o después de completar otro Task (sin SCHEDULE parameter)
+- Command a ejecutar
+
+**Lifecycle:** Crear Task no lo inicia automáticamente. Requiere `ALTER TASK RESUME` (necesita privilege global `EXECUTE TASK` - solo ACCOUNTADMIN por default - y ownership/operate privilege en el Task). Inicia timer según config. Pausar con `ALTER TASK SUSPEND`.
+
+**DAG (Directed Acyclic Graph):** Tasks pueden encadenarse. **Root task** define schedule para iniciar DAG run. **Child tasks** se activan tras successful completion del parent (no definen schedule). Tasks fluyen en una dirección. Un child task puede tener múltiples dependencias (espera a todas antes de ejecutar). Keyword `AFTER` seguido de parent task names separados por coma.
+
+**Límites DAG:** Max 1,000 Tasks por DAG. Un Task solo puede linkarse a 100 otros Tasks. Todos los Tasks en DAG deben tener mismo Task owner y estar en mismo database/schema.
+
+### Streams
+
+Schema-level object que permite ver inserts, updates y deletes hechos a una tabla **entre dos puntos en tiempo**. Se crea sobre una tabla y es queryable. Output tiene estructura idéntica a base table pero solo contiene **changed records**.
+
+**Metadata columns adicionales:**
+- `METADATA$ACTION`: Indica si operación DML fue INSERT o DELETE
+- `METADATA$ISUPDATE`: Indica si operación fue parte de UPDATE statement. Updates se representan como par DELETE + INSERT con ISUPDATE=true
+- `METADATA$ROW_ID`: ID único para trackear cambios a una fila específica over time
+
+**Funcionamiento:** Stream almacena un **offset** (punto desde el cual se registran cambios). Inicialmente vacío (solo muestra cambios after offset). Cambios se acumulan en Stream conforme se modifica base table.
+
+**Progresión del offset:** Usar Stream en DML statement (ej: `INSERT INTO downstream_table SELECT * FROM stream`). Esto consume los cambios y progresa el offset.
+
+**Integración con Tasks:** Task puede ejecutarse solo cuando Stream tiene datos usando `SYSTEM$STREAM_HAS_DATA()` (retorna Boolean). Task inserta cambios del Stream en downstream table, consumiendo cambios y progresando offset para que siguiente ejecución solo capture nuevos cambios.
+
+**Resumen:** Tasks + Streams = método para **procesamiento continuo** de nuevos/changed records. Crean continuous transformation pipelines cuando se encadenan.
+
+
+
