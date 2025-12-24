@@ -239,4 +239,276 @@ Schema-level object que permite ver inserts, updates y deletes hechos a una tabl
 **Resumen:** Tasks + Streams = método para **procesamiento continuo** de nuevos/changed records. Crean continuous transformation pipelines cuando se encadenan.
 
 
+# Billing
+
+## Modelos de Pricing
+
+**On Demand:** Similar a pay-as-you-go de otros cloud providers. Solo pagas por recursos usados, invoice mensual. Mínimo $25/mes. Sin acuerdos de licencia a largo plazo.
+
+**Pre-Purchased Capacity:** Comprar cantidad dollar upfront. Rates significativamente más bajos que on demand. Ideal si uso es predecible (ej: mínimo 100 horas compute/mes). Si uso es variable, on demand tiene más sentido.
+
+## Áreas de Billing
+
+**1. Virtual Warehouse Services:** Costo de customer-managed virtual warehouses creados y usados para ejecutar queries.
+
+**2. Cloud Services:** Operaciones que no usan user-managed VWs pero cuestan compute. Ejemplos: metadata operations (CREATE TABLE, SHOW, DESCRIBE commands).
+
+**3. Serverless Features:** Snowflake gestiona compute resources (no customer-managed VWs). Ejemplos: Snowpipe (auto-ingesta files), clustering, materialized views. Snowflake spinnea compute behind the scenes, gestiona scaling, resizing y duration.
+
+**4. Data Storage:** Storage en stages (temporal) o tables (long-term).
+
+**5. Data Transfer:** Transferir datos out of Snowflake o entre accounts si destino está en diferente región o cloud provider.
+
+## Snowflake Credits
+
+**Definición:** Unidades de billing para medir consumo de compute resources. Un credit representa valor monetario basado en cloud provider, región y Snowflake edition. Services con compute (VWs, cloud services, serverless) usan credits. Storage y data transfer usan moneda directa ($/TB).
+
+### Virtual Warehouse Services
+
+**Factores:** (1) VW size - cada tamaño tiene hourly credit rate diferente (XS = 1 credit/hora), (2) Duration en started state - consumo calculado per-second mientras está activo. **Suspended = no consume credits**.
+
+**Importante:** Costo NO se basa en número/complejidad de queries, sino en started vs suspended state. Minimum billable period: 60 segundos (si corre 30 seg, se cobra 1 min). Después de 60 seg, billing per-second.
+
+**Ejemplo:** XS VW por 2.5 horas = 2.5 credits. Si credit cuesta $4 en tu región = $10 total.
+
+### Cloud Services
+
+Queries que usan cloud services se cobran a **4.4 credits/compute hour**. Ejemplos: CREATE TABLE (no usa VW, solo cloud services). Aunque rate parece alto, queries son muy rápidas.
+
+**Cloud Services Adjustment:** Solo se cobra cloud services usage que **excede 10% del daily usage de VW compute**. Se calcula diariamente. Ejemplo: 16 credits VW + 1.1 credits cloud services → no pagas cloud services (1.1 < 10% de 16).
+
+### Serverless Features
+
+Cada feature (clustering, Snowpipe, database replication, materialized views) tiene su propio credit rate per compute hour. Usan compute Y cloud services en background, cada tipo con su rate. Ejemplo: Materialized view maintenance = 10 credits/hora (compute) + 5 credits/hora (cloud services).
+
+**Cloud services adjustment NO aplica a serverless features.**
+
+## Data Storage y Transfer
+
+**Data Storage:** Flat rate (no credits), calculado mensualmente basado en daily average de on-disk bytes. Incluye: database tables (con Time Travel y Fail-Safe data), files en Snowflake-managed stages. Files pueden comprimirse en stages. Costo: flat rate per TB según account type (capacity/on demand), cloud provider y región.
+
+**Data Transfer:** Per-byte fee si transfieres datos entre regiones o entre cloud platforms. Costo depende de región y platform del account. 
+
+**Casos con charges:**
+- `COPY INTO location` unloading data a diferente cloud provider/región
+- Database replication a account en diferente región/platform
+- External functions (procesan data outside Snowflake)
+
+**Ejemplo:** Unload data desde AWS London a Azure Tokyo = costo adicional vs mismo provider/región.
+
+# SnowSQL
+
+Command-line utility para ejecutar SQL statements en tu Snowflake account desde máquina local. Útil para automatizar jobs, integración con CI/CD pipelines, o si prefieres command line sobre UI.
+
+## Capacidades
+
+Ejecuta casi todos los comandos disponibles en UI: DML (INSERT, UPDATE, DELETE, MERGE), DDL (CREATE, ALTER), DQL (SELECT), account management (set parameters), loading/unloading data. Limitaciones: funcionalidades únicas de UI como graphing (ej: credit consumption).
+
+## Instalación y Configuración
+
+Disponible para Linux, macOS, Windows en developers.snowflake.com/snowSQL. Instalación crea carpeta hidden `.snowsql` en user directory con:
+- **Binaries folder** (versión SnowSQL)
+- **auto_upgrade:** Para upgrades automáticos
+- **config:** Configurar connection parameters por defecto (account, username, password) para evitar supplierlos cada vez
+- **history:** Almacena comandos ejecutados
+
+## Connection Parameters
+
+**Required:** `-a` (account identifier = `organization_name-account_name`, obtener con `SHOW ACCOUNTS` usando ACCOUNTADMIN/ORGADMIN role)
+
+**Opcionales:** `-u` (username), `--database`, `--schema`, `--role`, `--warehouse`
+
+**Security:** Passwords NO pueden pasarse vía parameters. Deben ingresarse vía interactive prompt, config file (option `password`), o environment variable.
+
+## Modos de Uso
+
+**1. Interactive Mode:** Construir SQL statements con auto-complete (session IDs, databases, schemas, tables). Salir con CTRL+D.
+
+**2. One-off Query:** `-q` parameter para ejecutar query única sin entrar a interactive mode.
+
+**3. SQL File Execution:** `-f` parameter para especificar SQL file. Ejecuta statements secuencialmente, retorna resultados y sale. Útil para ambientes automatizados.
+
+## Comandos Predefinidos
+
+**!help:** Lista comandos disponibles (administración SnowSQL + functional SQL commands)
+
+**!options:** Ver opciones disponibles y valores actuales (ej: variable_substitution, text color)
+
+**!set:** Configurar opciones (ej: `!set variable_substitution=true`)
+
+**!define:** Definir SQL variables (ej: `!define table_name=customer`)
+
+**!variables:** Listar variables definidas
+
+**Uso de variables:** Prefix con `&` en SQL statements (ej: `SELECT * FROM &table_name`). Pueden supplirse al invocar SnowSQL para parametrizar SQL files.
+
+## Data Loading
+
+**PUT command:** Subir file desde local filesystem a Snowflake stage. Syntax: `PUT file://path/to/file @stage_name`
+
+**COPY INTO:** Convierte raw file (ej: CSV) a Snowflake table storage format. Syntax: `COPY INTO table_name FROM @stage_name`
+
+**!exit:** Salir de CLI.
+
+# Conectividad
+
+## Drivers y Connectors
+
+Snowflake mantiene drivers y connectors open-source para conectar programáticamente y desarrollar aplicaciones. Soportan: **Python** (snowflake-connector-python package), **Go**, **PHP**, **.NET**, **Node.js**.
+
+**Spark Connector:** Permite a Spark cluster read/write en Snowflake tables. Snowflake aparece como otra data source (similar a Postgres, HDFS, S3).
+
+**Kafka Connector:** Para Confluent o open-source Kafka. Lee datos de Kafka topics y los carga en Snowflake tables.
+
+**JDBC/ODBC:** Permiten conectividad con third-party tools no oficialmente partnered y lenguajes como Java o C++.
+
+**Ejemplo Python:** Install package → import → crear connection object (username, password, account identifier) → crear cursor para ejecutar SQL statements y traverse results → ejecutar queries.
+
+## Technology Partners
+
+Third-party solutions certificadas por Snowflake para native connection/integration. Cinco categorías:
+
+**1. Business Intelligence:** Software para análisis de datos, visualizaciones, dashboards. Ejemplos: Tableau, Power BI, QlikView, ThoughtSpot.
+
+**2. Data Integration:** Tomar datos de source system, ponerlos en Snowflake con transformaciones. Ejemplos: dbt, Informatica, Pentaho, Fivetran.
+
+**3. Security & Governance:** Data governance (Collibra), monitoring (Datadog), secrets storage (HashiCorp Vault), data cataloging (data.world).
+
+**4. Machine Learning & Data Science:** Herramientas especializadas para workloads ML/DS con Snowflake data. Ejemplos: DataRobot, Dataiku, Amazon SageMaker, Zepl.
+
+**5. SQL Development & Management:** Gestión de modeling, development y deployment de SQL code. Ejemplos: SqlDBM, SeekWell, Agile Data Engine.
+
+**Partner Connect:** Feature en Snowflake UI para crear trial accounts con partner tools expeditamente. Usa setup wizard que crea objects en Snowflake (database, warehouse, roles) específicos para el partner tool.
+
+## Snowpark
+
+API para query y procesar datos usando lenguajes high-level (Java, Scala, Python) como alternativa a SQL. Abstracción principal: **DataFrame** (estructura 2D de rows y columns, similar a spreadsheet o pandas/Spark DataFrames).
+
+**Modelo de computación:**
+- **Lazy evaluation:** Operaciones se ejecutan solo cuando se solicita una acción (ej: `collect()`, `show()`), no cuando se declaran
+- **Pushdown model:** Todas las operaciones usan Snowflake compute, **no se transfiere data** fuera de Snowflake (contraste con Spark connector que mueve data a Spark cluster)
+
+**API Methods:** Proporciona métodos como `select()`, `join()`, `drop()`, `union()`, `filter()`, `groupBy()`, `count()`, `withColumnRenamed()`, `write()`.
+
+**Workflow típico:**
+1. Import Snowpark libraries
+2. Crear session con connection parameters (account, user, password, role, warehouse, database, schema)
+3. Crear DataFrame desde tabla (`session.table("table_name")`) o SQL query (`session.sql("SELECT...")`)
+4. Aplicar transformaciones (filter, groupBy, etc.) encadenándolas con dot operator
+5. Escribir resultados a tabla (`write.mode("overwrite/append").saveAsTable()`)
+6. Cerrar session
+
+**DataFrames:** Colección de row objects con schema definido. Cada row contiene column names y values. Lazily evaluated (resultados se recuperan al llamar `collect()` o `show()`, no al crear DataFrame).
+
+**Objetivo:** Evitar que developers tengan que mover data fuera de Snowflake para usar su lenguaje preferido.
+
+# Snowflake Scripting
+
+Extensión de Snowflake SQL que añade soporte para **lógica procedural**: looping, branching, exceptions, declaración/asignación de variables. Código puede implementarse en stored procedure o ejecutarse directamente en worksheet.
+
+## Scripting Block Structure
+
+**1. DECLARE (opcional):** Define variables, cursors, result sets, exceptions.
+
+**2. BEGIN...END:** SQL statements y scripting constructs (loops, branching). `BEGIN` también inicia transacciones. Snowflake recomienda `BEGIN TRANSACTION` para evitar confusión.
+
+**3. EXCEPTION (opcional):** Exception handling code (qué hacer si hay error).
+
+## Anonymous Block vs Stored Procedure
+
+**Anonymous Block:** Ejecutado fuera de stored procedure. Variables solo accesibles dentro del scope del block. Objects creados (ej: tables) accesibles fuera del block.
+
+**Stored Procedure:** Contiene misma lógica procedural en long-lived object, bueno para sharing entre usuarios y código repeatable.
+
+**Nota:** SnowSQL y classic console requieren wrapping scripting blocks en `$$`. Snowsight no lo necesita.
+
+## Características Principales
+
+**Variables:** Declarar con data type o inferir tipo con `LET`. Asignar con `:=` o `LET`. Usar funciones en blocks.
+
+**Branching:** IF-ELSE statements, CASE statements.
+
+**Looping:** FOR loop, WHILE loop, REPEAT, LOOP. FOR loop example: inicializar valor, iterar hasta max, ejecutar cálculos por iteración.
+
+**Cursors:** Para loop sobre records en tabla. Declarar: `cursor_name CURSOR FOR query`. Ejecuta cuando se llama (no cuando se declara). Loop through cursor para procesar cada row.
+
+**Result Sets:** SQL data type similar a cursor pero ejecuta query cuando se asigna a variable (no cuando se llama), por eso "holds results of query". Acceso vía `TABLE()` function (retorna all/subset de rows) o iterando con cursor.
+
+**RETURN:** Keyword para retornar resultado del block.
+
+
+# Snowflake AI Features: Cortex y Machine Learning
+
+Snowflake cambió su nombre a "Snowflake AI Data Cloud" para señalar el enfoque en AI technologies, principalmente large language models (LLMs). Dos grupos principales: **Cortex** (features usando LLMs) y **Machine Learning** (ML functions in-built para técnicas tradicionales como classification/forecasting, más capacidad de crear custom ML functions).
+
+## Cortex Features
+
+### Cortex AI SQL Functions
+
+Extienden SQL con funciones AI-related ejecutables como cualquier función normal. Ejemplo principal: **AI_COMPLETE**
+
+**Parámetros:**
+- **Prompt (string):** Pregunta a responder o instrucción creativa
+- **Model name (string):** LLM a usar (Snowflake propios, OpenAI, Anthropic, Meta, Mistral AI, DeepSeek). Elección afecta output y precio (modelos Snowflake más baratos)
+- **Model parameters opcionales:** Temperature (controla randomness), guardrails (feature Snowflake que filtra respuestas potencialmente dañinas)
+
+**Uso práctico:** Responder preguntas sobre datos. Ejemplo: `AI_COMPLETE(prompt, model)` para resumir columnas de texto (ej: reviews), output puede poblar nueva columna para facilitar análisis de free text.
+
+### Snowflake Copilot
+
+LLM-powered SQL assistant en panel UI. Genera SQL code desde preguntas en plain English. Entiende contexto de datos (database structure, tables, columns, objects) pero **no puede generar cross-database o cross-schema queries**. También sugiere mejoras a queries escritos (performance, concisión) y ayuda a descubrir Snowflake features desde documentación.
+
+**Funcionalidad:** Click "Run" (añade query a worksheet y ejecuta automáticamente) o "Add" (añade a worksheet para ejecutar después).
+
+**Limitación:** Depende de object comments (table/column comments). Si no están bien documentados, puede ser limitado en entender datos out-of-the-box.
+
+### Document AI
+
+Extrae datos (nombres, fechas, checkbox values) desde documentos no estructurados (PDFs). Usa LLM propietario de Snowflake llamado **Arctic Tilt**.
+
+**Workflow:**
+1. **Crear model build** (vía UI → AI and ML → Document AI): Representa un tipo de documento del cual extraer datos
+2. **Apuntar a sample PDFs** previamente uploaded a stage
+3. **Definir questions:** Prompts para extraer tipos específicos de datos usando OCR. Model retorna answer + confidence score (0.9 = 90% confidence)
+4. **Review y fine-tuning:** Verificar accuracy en samples, corregir respuestas incorrectas, opcionalmente fine-tune foundational model
+5. **Publish model build:** Usar en SQL code con syntax `!PREDICT(model_build_name, file_url, optional_version)`. Retorna JSON con confidence scores y valores extraídos
+
+### Cortex Fine-Tuning
+
+Tomar output de large model para entrenar smaller model, más rápido, barato y mejor en tarea específica. Use case: millones de social media posts, calcular sentiment.
+
+**Proceso:**
+1. Usar large model para generar accurate labels en sample dataset (ej: 10K posts con sentiment via `AI_COMPLETE`)
+2. **Crear fine-tuning job** con `FINETUNE()` function: especificar output model name, base model, training data query
+3. Usar fine-tuned smaller model para analizar resto de datos (mucho más eficiente)
+
+**Ahorro ejemplo:** Claude Opus (12 credits/1M tokens) vs Mistral 7B fine-tuned (0.12 credits/1M tokens) = 100x menos costo.
+
+**Comandos:** `FINETUNE()` para crear job, `SHOW`/`DESCRIBE` para check status, `CANCEL` para stop job.
+
+### Cortex Search
+
+Combina **keyword search** con **semantic search** (busca por significado, no solo palabras exactas). Usa **embeddings** (representaciones numéricas de texto) y **vector search** (comparar vectors usando matemáticas). Si dos textos tienen significado similar, sus vectors están cerca.
+
+**Implementación:**
+1. Crear **Cortex Search Service** que indexa columna de texto para semantic vector-based searching
+2. **Attributes:** Filtrar resultados por columnas específicas (ej: product_ID, customer_ID, review_date)
+3. **Target lag:** Refresh frequency del índice (ej: 30 minutos)
+4. Especificar embedding model default de Snowflake
+
+**Uso:** REST API endpoint (enviar POST requests) o Snowflake Python SDK. Retorna JSON payload con resultados.
+
+### Cortex Analyst
+
+REST API fully-managed que convierte plain text questions sobre structured data en SQL commands y retorna resultados. Para construir chat interface sobre datos Snowflake, útil para non-technical business users.
+
+**Arquitectura:**
+- **Bottom:** Structured data en Snowflake tables
+- **Middle:** Cortex Analyst REST API (entre tables y frontend app)
+- **Top:** Frontend app (comúnmente Streamlit - open-source tool para interactive web apps en Python, natively supported por Snowflake)
+
+**Uso en Streamlit:**
+- Call API vía `get_analyst_response()` function
+- Proveer: (1) **Semantic model** (YAML document con tables, columns, elementos accesibles - bridges gap entre data definition en metadata y cómo business user phrase questions), (2) **Prompt/chat history**
+- API retorna JSON con response y SQL usado, mostrado en Streamlit app
 
