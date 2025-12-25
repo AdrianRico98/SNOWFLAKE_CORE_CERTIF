@@ -149,3 +149,25 @@ Método usando par de cryptographic keys (public y private) como alternativa a u
 **OAuth:** Snowflake soporta OAuth 2.0 protocol. Open standard protocol que permite supported clients authorized access a Snowflake **sin compartir/almacenar user login credentials**. Ejemplo: Tableau client conecta a Snowflake sin mantener usernames/passwords (delegated authorization - user delega habilidad de read data a client). Dos pathways: Snowflake OAuth y External OAuth.
 
 **SCIM (System for Cross-domain Identity Management):** Facilita management de user identities y groups (en Snowflake = roles). IdP como ADFS usa SCIM client para hacer RESTful API requests a Snowflake SCIM server. Snowflake verifica request y realiza acciones en roles/users. Usos: manage user lifecycle (crear/delete users, update settings), map Active Directory groups a Snowflake roles.
+
+## Network Policies
+
+Por default, Snowflake no bloquea IPs de acceder al account URL. **Network policies** permiten allow/deny acceso basado en IP addresses (capa adicional de seguridad sobre authentication).
+
+### Componentes
+
+**Network Rules:** Objects que almacenan single IP o range de IPs. Parámetros: MODE (ingress para inbound traffic), TYPE (IPv4, IPv6 no soportado), VALUE_LIST (IPs en CIDR notation o single IPs separadas por comas).
+
+**Network Policy:** Referencia network rules para allow/block traffic. Tiene ALLOWED_NETWORK_RULE_LIST y BLOCKED_NETWORK_RULE_LIST (ambos opcionales). Si solo defines allowed list, todo fuera del range es denied. Si IP está en ambas listas, **blocked se aplica primero**.
+
+### Aplicación
+
+**Privileges:** SECURITYADMIN, ACCOUNTADMIN, o custom role con CREATE NETWORK POLICY/RULE privilege. Crear policy NO la activa, debe **aplicarse** (account o user level).
+
+**Account-level:** Solo una policy activa a la vez (reemplaza anterior). Ver con `SHOW PARAMETERS`.
+
+**User-level:** Restringe IPs desde donde user puede conectar. Usa `ALTER USER`. Si user tiene ambas, **user-level toma precedencia**.
+
+**Bypass temporal:** Property `MINS_TO_BYPASS_NETWORK_POLICY` solo configurable por Snowflake Support.
+
+**Workflow:** Crear network rule (IPs) → crear network policy (referencia rules) → aplicar a account/user.
