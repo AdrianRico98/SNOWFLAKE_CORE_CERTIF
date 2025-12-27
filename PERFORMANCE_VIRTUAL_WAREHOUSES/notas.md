@@ -133,3 +133,211 @@ Cada Snowflake credit representa **monetary value** basado en:
 - Large warehouse, 3 horas, Enterprise edition, AWS Tokyo = 24 credits ≈ $103
 
 Gran diferencia en costs dependiendo de configuración.
+
+
+## Scaling de Virtual Warehouses
+
+Conforme workload cambia over time (ej: ingest 100x más data, onboard 20+ analysts), necesitas métodos para scale compute para meet new demands. Virtual warehouses scale de dos formas primarias: **scale up** y **scale out**.
+
+### Scale Up
+
+Proceso de alter size de **individual virtual warehouse** con objetivo de improve query performance. `ALTER WAREHOUSE ... SET WAREHOUSE_SIZE = ...` command puede cambiar size de running warehouse (ej: XS a Large).
+
+**Cuándo scale up:** Query taking unusually long to complete (no stuck en queue, sino single query running very long). Quizás dataset muy large o query sufficiently complex para burden current size warehouse.
+
+**Para exam:** Scaling up = improve query performance.
+
+**Verificación:** Query profile tool en Snowflake UI para verificar si query está exceeding resources de warehouse (indicaciones: spilling to disk, spilling to remote disk).
+
+**No automatizado:** Requiere direct user interaction. Puede hacerse vía UI también.
+
+**Queries existentes:** Resizing running warehouse **no detiene queries** que ya lo usan. Extra compute resources de larger size solo used para **queued y new queries**.
+
+**Decreasing size:** Remueve compute resources de warehouse. Cuando resources removed, **cache associated dropped** (como suspending warehouse). Puede negative impact query performance (ya no tiene raw table data en cache, debe hacer call a remote long-term storage).
+
+### Scale Out (Multi-Cluster Warehouses)
+
+Habilitado por feature **multi-cluster warehouses**: named pools de virtual warehouses que automáticamente add/remove individual warehouses dynamically en response a número de concurrent users o queries. Intención: improve **query throughput** cuando many users issuing queries simultaneously.
+
+**Parámetros:**
+- **MIN_CLUSTER_COUNT:** Minimum número de warehouses en multi-cluster warehouse
+- **MAX_CLUSTER_COUNT:** Maximum número de warehouses
+
+#### Modos de Multi-Cluster Warehouse
+
+**1. Maximized Mode:** Setting MIN y MAX al **mismo número**. Mantiene static number de virtual warehouses running. Usado cuando concurrent user sessions/queries **no fluctúan significantly**.
+
+Example: MIN=4, MAX=4 → multi-cluster warehouse siempre hecho de 4 virtual warehouses (a menos que suspended/dropped).
+
+**Nota:** All virtual warehouses en Enterprise+ editions configuradas como multi-cluster pero en maximized mode con MAX=1, MIN=1.
+
+**2. Auto-Scale Mode:** Setting MIN y MAX **differently**. Snowflake add/remove warehouses dynamically based on usage curve.
+
+**SCALING_POLICY property:** Controla cómo multi-cluster warehouse scales en auto-scale mode. Acepta dos valores:
+
+**Standard Policy:** Objetivo = minimize queuing, más aggressively scaling out warehouses.
+- Cluster inicia con MIN_CLUSTER_COUNT warehouses
+- Additional warehouse añadido **immediately** cuando query is queued
+- **Scale down:** Check every 1 minute si load en least busy warehouse puede redistributed a otros warehouses con spare capacity. Si sí, después **2-3 minutes** warehouse marked for shutdown, subsequent queries rebalanced
+
+**Economy Policy:** Objetivo = conserve credits. Warehouses run fully loaded for longer.
+- Cluster inicia con MIN_CLUSTER_COUNT warehouses
+- Additional warehouse solo añadido si system estimates hay **enough query load** para keep new warehouse busy **at least 6 minutes** (puede lead a queries queuing longer que standard mode, pero longer period determina si increase en usage es anomalous o genuinely increasing enough para warrant adding warehouse)
+- **Scale down:** Check every 1 minute, pero warehouse marked for shutdown después **5-6 minutes** (vs 2-3 en standard)
+
+### Billing Multi-Cluster Warehouses
+
+**Total credit cost** = sum de all running individual warehouses en cluster.
+
+**Maximum credits consumption:** MAX_CLUSTER_COUNT × hourly credit rate de warehouse size.
+
+Example: Medium-sized multi-cluster warehouse con 3 warehouses = 12 credits/hour (si all 3 running durante hour completa).
+
+**Realidad:** Multi-cluster warehouses scale in/out based on demand → typical obtener fraction de maximum credit consumption (un warehouse run 2 horas, otro shutdown después 1 hora → billed solo cuando active = total 3 horas).
+
+### Warehouse Properties para Queuing y Concurrency
+
+**1. MAX_CONCURRENCY_LEVEL:**
+- Determina cuántos concurrent SQL statements pueden submitted a warehouse antes de queued o additional compute provided
+- Multi-cluster maximized mode: additional compute = manual scaling up
+- Auto-scale mode: automatic addition de warehouses
+- **Default:** 8 queries
+
+**2. STATEMENT_QUEUED_TIMEOUT_IN_SECONDS:**
+- Time en segundos que SQL statement puede estar queued en warehouse antes de aborted
+- Aplicable a warehouse específico o globalmente como session parameter
+- **Default:** No timeout (query puede wait indefinidamente para compute resources)
+
+**3. STATEMENT_TIMEOUT_IN_SECONDS:**
+- Similar a anterior pero no solo para queued queries
+- Time en segundos después del cual any running SQL statement es aborted
+- Usado para stop queries running por unreasonable amount de time
+
+## Resource Monitors
+
+Standalone objects que permiten set **credit consumption limits** en user-managed virtual warehouses. Pueden aplicarse a account level (monitoring múltiples warehouses en account) o individual warehouses.
+
+**Propósito:** Track credit consumption a high level para prevent runaway costs.
+
+**Límites:** Pueden set para specified interval o date range (daily, weekly, monthly). Cuando límites reached o approaching, resource monitor puede trigger actions: send alert notifications o suspend warehouse.
+
+**Creación:** Solo **ACCOUNTADMIN** role puede crear resource monitors. Account admins pueden allow otros roles view/modify resource monitors.
+
+### Properties de Resource Monitor
+
+**CREDIT_QUOTA:** Número de credits (any size) usado como upper limit para determinar cuándo certain action es triggered.
+
+**FREQUENCY:** Cuándo credit quota será reset (restarting monitoring). Accepted values: DAILY, WEEKLY, MONTHLY, YEARLY, NEVER. Example: DAILY con 100 credits = 100 credits/día base para monitoring notifications. NEVER = credit quota never resets, assigned warehouse continúa usando credits hasta reach quota.
+
+**START_TIMESTAMP:** (Opcional) Default = resource monitor starts monitoring immediately. Puede cambiar para start later. Frequency value sería relative a newly specified start timestamp.
+
+**TRIGGERS:** Compuesto de dos partes:
+1. **Condition:** Expresado como percentage de credit quota
+2. **Action:** Qué hacer al reach condition
+
+**Actions disponibles:**
+- **NOTIFY:** Send alert notification a all account admins con notifications enabled
+- **SUSPEND:** Send alert notification + suspend virtual warehouse(s) attached a resource monitor, pero solo **after** currently running queries completed
+- **SUSPEND_IMMEDIATE:** Similar a SUSPEND pero **no wait** para queries complete. Hard stop, abort running queries y suspend virtual warehouses
+
+**Aplicación:** Una vez creado, puede aplicarse a **single virtual warehouse** o a **account level**.
+
+## Query Acceleration Service (QAS)
+
+Feature que se habilita en virtual warehouse para dynamically add **serverless compute power** solo cuando sufficiently complex query lo necesita. Contraste con multi-cluster warehouses (created/defined por users): cómo additional compute resources allocated con QAS está completamente **controlled by Snowflake** (classified como serverless feature).
+
+### Funcionamiento
+
+Cuando QAS enabled en warehouse:
+1. Snowflake analiza query plan de submitted query
+2. Offload fragments que pueden run in parallel a dynamically requisitioned serverless compute
+3. Example: joining 3 tables → offload large table scan operation a serverless compute → join result con otras table scans en virtual warehouse's compute
+4. Query completa → serverless compute relinquished → solo pagas por task performed helping complete complex query
+
+**Beneficio:** Speeds up query execution → improves overall utility de warehouse (free para work en otras queries).
+
+### Use Case Example
+
+**Scenario:** Team de data analysts usando Large virtual warehouse para query transform table. Plot utilization across typical day:
+- **Most of time:** Run similar queries (simple/medium complexity), never fully utilizing warehouse
+- **Occasionally:** Analyst runs ad hoc complex query reading large data → fully utilizes warehouse → other analysts' queries start getting queued
+
+**Options sin QAS:**
+1. **Scale up:** Increase warehouse size → pagar por larger warehouse incluso cuando utilization low
+2. **Multi-cluster warehouse:** Works pero requiere setup, puede lead a paying more que expected (depends on scaling policy)
+
+**QAS aim:** Provide burst de compute behind scenes → query causing spike finishes quicker → improves concurrency.
+
+### Queries Elegibles para Acceleration
+
+**Importante:** Turning ON QAS NO necessarily boost every query que tarda too long. Solo **certain queries** pueden accelerated.
+
+**Dos factores primarios dictating elegibilidad:**
+1. **Parte del query debe poder run in parallel** (ej: scan con aggregation)
+2. **Número de partitions a escanear** (size de data being queried)
+
+**Verificar elegibilidad:**
+- `QUERY_ACCELERATION_ELIGIBLE` view
+- `SYSTEM$ESTIMATE_QUERY_ACCELERATION()` function
+
+### SYSTEM$ESTIMATE_QUERY_ACCELERATION Function
+
+**Input:** Query ID de previously executed query.
+
+**Output:** JSON object con dos formas:
+
+**1. Query INELIGIBLE:**
+```json
+{
+  "estimatedQueryTimes": {},  // Empty
+  "originalQueryTime": <seconds>,
+  "queryId": "<id>",
+  "eligible": false,
+  "upperLimitScaleFactor": null
+}
+```
+
+**2. Query ELIGIBLE:**
+```json
+{
+  "estimatedQueryTimes": {
+    "1": <seconds>,
+    "2": <seconds>,
+    "3": <seconds>
+  },
+  "originalQueryTime": <seconds>,
+  "queryId": "<id>",
+  "eligible": true,
+  "upperLimitScaleFactor": <max_scale_factor>
+}
+```
+
+**estimatedQueryTimes:** Object asociando estimated execution time (segundos) con **scale factor**.
+
+**Scale factor:** Option que set en warehouse determinando cuántas veces el size de current warehouse quieres que query tenga available para accelerate. Usar original query time con estimated improvements para determinar dónde tiene sentido set scale factor (weighing cost vs performance).
+
+**upperLimitScaleFactor:** Highest scale factor en estimatedQueryTimes object. Indica punto donde recibes maximum benefit scaling up.
+
+**Nota:** Function es solo **estimate** de si query podría potentially usar QAS. Para ver si works in practice, necesitas enable y monitor effects.
+
+**Monitoring:** Query profile tool → statistic "scan selected for acceleration" + total query runtime.
+
+### Habilitación y Cost
+
+**Enable QAS:** `CREATE WAREHOUSE ... ENABLE_QUERY_ACCELERATION = TRUE` o `ALTER WAREHOUSE ... SET ENABLE_QUERY_ACCELERATION = TRUE`
+
+**MAX_SCALE_FACTOR:** Controls cuántos compute resources QAS usará, expresado como **multiplier de warehouse size**.
+
+**Setting:** `QUERY_ACCELERATION_MAX_SCALE_FACTOR = <value>`
+- **Default:** 8
+- **Range:** 0-100 (0 = no limits en cuánto compute será leased para accelerate eligible queries)
+- **Upper limit reason:** Si query puede accelerated/completed con less compute, lo hará. Si Snowflake can't provision enough resources in time (not available en shared pool), otra razón para no reach upper scale factor
+
+**Credit Consumption:**
+
+Turning ON QAS y upping scale factor puede **potentially increase credit consumption**.
+
+**Example:** MAX_SCALE_FACTOR=3, Large warehouse (8 credits/hora)
+- **Maximum additional credits QAS:** Si accelerating queries por 1 hora continuously = 24 credits (3 × 8)
+
+**Billing:** QAS es serverless feature, billed **every second** QAS está accelerating query. Example: single large query causing queuing, solo needs ON por 1 minuto → solo 60 segundos billed.
