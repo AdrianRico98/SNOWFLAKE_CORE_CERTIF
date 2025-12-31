@@ -218,3 +218,352 @@ CREATE STAGE ... FILE_FORMAT = my_format;
 - **COMPRESSION:** Tells Snowflake qué compression form usado (varies by type - CSV/JSON: identical options, Parquet: limited a 4 options). Snowflake recomienda compress files stored en stage
 
 **Default:** COPY statements no require file format specified. Por default, COPY statement intenta interpret CSV con no headers usando UTF-8 encoding.
+
+## Snowpipe (Continuous Data Ingestion)
+
+Serverless feature que **automatically load data files en near real-time** en table as soon as files available en stage. Ejemplo: upload file a S3 external stage → Snowflake listening para notification de event → spins up compute para copy new data en table. Solo action que performs user: upload initial data file.
+
+**Contraste con bulk loading:** Manual process de execute COPY INTO table statement.
+
+**Razón de existir:** Response al shift en how data is produced - smaller batches generadas at quicker pace conforme streaming systems (Kafka, Beam, Kinesis) se vuelven más popular. Manually loading data files arriving every minute no sería practical.
+
+### Pipe Object
+
+Functionality enabled con object llamado **pipe**. DDL define COPY statement (similar a manual run) specifying stage y target table. Esto es lo que ejecuta on your behalf. All file formats supported, transformations pueden incorporarse.
+
+### Dos Modos (AUTO_INGEST)
+
+**1. AUTO_INGEST = TRUE (Cloud Messaging):**
+- Más comúnmente usado
+- Solo works con **external stages**
+- Configure cloud blob storage (ej: S3 bucket) para send Snowflake notification telling new file uploaded
+- Acts como trigger para Snowflake execute COPY INTO statement defined en pipe
+
+**Process flow (AWS example):**
+1. Upload file a S3 bucket usando cloud provider utilities
+2. S3 bucket configured (vía event notifications) para send per-object notification a SQS Queue cuando file uploaded
+3. **SQS Queue managed por Snowflake** (created cuando created pipe object). Notification holds info en qué files to load
+4. Vía SQS Queue, pipe knows spin up compute y perform COPY INTO table statement configured en pipe body
+5. **Within minute** de upload file, data should appear en target table (decryption/file size pueden affect time)
+
+**2. AUTO_INGEST = FALSE (REST API):**
+- User lets Snowflake know cuando new file uploaded vía call a Snowflake REST endpoint
+- Works con **internal y external stages**
+- Client applications (Java/Python SDKs provided) call Snowflake vía public **insertFiles REST endpoint** providing list de file names uploaded a stage + reference a pipe
+- Snowflake-provided compute resources execute COPY INTO table command en pipe definition para populate target table
+
+### Facts para Exam
+
+✅ **Intended para:** Load many **small files quickly**. Typically takes ~1 minuto load file once receive notification.
+
+✅ **Serverless feature:** Perform COPY INTO operation usando **Snowflake-managed compute resources** (NO user-managed virtual warehouse). Scales compute to meet demands.
+
+✅ **Load history:** Stored en pipe metadata por **14 días** (prevent reloading same files, duplicating data en table).
+
+✅ **Pause capability:** Cuando pipe paused, event messages received enter **limited retention period de 14 días** (default), allowing process cuando pipe resumed. Si pipe paused >14 días = **stale**.
+
+### Snowpipe vs Bulk Loading
+
+| Aspecto | Bulk Loading | Snowpipe |
+|---------|--------------|----------|
+| **Authentication** | Security options supported por client (ej: username/password en Python) | REST endpoints requieren **key pair authentication con JSON web tokens** |
+| **Load history** | Stored en target table metadata **64 días** | Stored en pipe metadata **14 días** |
+| **Compute** | Requiere **user-created warehouse** | Usa **Snowflake-supplied compute resources** |
+| **Billing** | Billed como queries (time VW active) | **Serverless billing:** Compute resources + overhead (**0.06 credits per 1,000 files** notified/listed vía event notifications o REST API calls) |
+
+### Best Practices (Bulk + Snowpipe)
+
+✅ **Split large files:** Múltiples files around **100-250 MB compressed data**. Single server en warehouse can process up to **8 files in parallel** → providing one large file no utiliza whole warehouse capacity. Files exceeding **100 GB not recommended**, should be split.
+
+✅ **Bundle small files:** Si many very small files (ej: 10 KB messages), bundle up en larger files para avoid too much processing overhead.
+
+✅ **Organize stage data by path:** Copy any fraction de data en Snowflake con single command. Permite execute concurrent COPY statements matching subset de files (taking advantage de parallel operations).
+
+✅ **Separate warehouses:** Tener separate virtual warehouses para data loading tasks vs other tasks. Enables **workload isolation** (COPY INTO statements not queued/causing other queries queue).
+
+✅ **Pre-sort data:** Ordering de data as copied in es important. Organizing stage data creates natural order → translates en micro-partitions más evenly distributed → improved pruning potential.
+
+✅ **Snowpipe frequency:** No upload files at shorter frequency than **1 minute**. Loading very small files more often que once per minute → Snowpipe can't keep up con processing overhead → files back up en queue, incur costs.
+
+## Data Unloading
+
+Proceso similar a how we got data in. Usar **COPY INTO location** command y **GET** command para get data out de Snowflake.
+
+### COPY INTO Location
+
+Unload contents de table a any internal stage, external stage, o external location. También puede copy output de query.
+
+**File formats soportados (más limitado que COPY INTO table):**
+- Delimited files: CSV, TSV
+- Semi-structured: JSON, Parquet
+
+**Default behavior:**
+- Results split en **multiple files** (exact number impacted por size de virtual warehouse executing command)
+- Generated files en **CSV format**
+- **Compressed usando Gzip**
+- Always encoded usando **UTF-8**
+
+**Encryption:**
+- Data files unloaded a Snowflake internal location: automáticamente encrypted usando **128-bit keys**. Files unencrypted cuando downloaded a local directory
+- Data files unloaded a cloud storage: pueden encrypted si security key provided a Snowflake
+
+### Syntax Examples
+
+**Copy from SELECT query:**
+```sql
+COPY INTO @stage_name
+FROM (SELECT ... FROM table)
+FILE_FORMAT = (TYPE=JSON)
+```
+
+**File prefix:** Files generated pueden prefixed con string incluyendo at end de stage definition (ej: `@stage_name/data_` → all files start con `data_`)
+
+**File format object:** Control over how files look (change default format a JSON, etc.)
+
+**Benefit de unload from query:** Puede include join clauses para download data from multiple tables.
+
+**Direct to external cloud storage:** Puede copy table contents directly a external cloud provider blob storage (ej: AWS S3 bucket) **without use de stage object**.
+
+### Copy Options
+
+**OVERWRITE (Boolean):** Indica si files generated por COPY INTO command overwrite files ya existentes en stage cuando tienen same name.
+
+**SINGLE (Boolean):** Por default, COPY INTO location splits result en multiple files. Set SINGLE=TRUE para produce **single file**.
+
+**MAX_FILE_SIZE:** Si SINGLE=FALSE (multiple files), controls size de cada file. Default: ~16 MB compressed.
+
+**INCLUDE_QUERY_ID (Boolean):** Uniquely identify loaded files incluyendo query ID de COPY statement en file names de unloaded data files. Helps ensure concurrent COPY statements don't overwrite unloaded files accidentally. **Cannot be set** si SINGLE, OVERWRITE o PARTITION BY in use.
+
+**PARTITION BY:** Partitions unloaded data en directory structure en destination stage. Accepts expression por el cual unload operation partitions table rows en separate files. Example: partition data en directories que map date.
+
+### GET Command
+
+Reverse de PUT. Specify source stage y target local directory para download file. Typically executed **after** using COPY INTO location command.
+
+**Características:**
+- **Cannot be used para external stages** (access vía own utilities como AWS console/CLI)
+- **Only used con internal stages**
+- **Cannot be executed from worksheet en UI**
+- Downloaded files automáticamente **decrypted** when using GET
+
+**Parameters:**
+- **PARALLEL:** Number de threads to use para downloading files. Increasing threads improve performance con large files. **Default: 10 threads**
+- **PATTERN:** Regular expression pattern para select files to download from stage. Si no pattern specified, GET command tries get **all files** en stage
+
+### Download vía UI
+
+**Classic UI:** Limit de **100 MB**
+
+**Snowsight:** **No hard limits**
+
+# Semi-Structured Data
+
+## Qué es Semi-Structured Data
+
+Data formats categorizados como semi-structured si comparten typical features evidentes en JSON y XML:
+
+**Características:**
+- **Flexible schema:** Number de fields puede vary from one entity to next (ej: un widget tiene image, otro no). Contrast con CSV (fixed number de columns)
+- **Self-describing fields:** Contain way para self-describe cada field included en entity (possible porque schemas pueden vary)
+- **Nested data structures:** Ej: image inside widget object
+- **Collections:** Arrays
+- **Keys y values:** Generally formed de key-value pairs
+
+**Historical challenge:** Difficult accommodate en data analysis systems, particularmente data warehouses. Sistemas antiguos designed para structured data en tables (optimizations para ese kind de data). Coercing field values de flexible file format como JSON en rigid structure como table puede resultar en missing columns (ej: JSON document con new field pero current table doesn't capture column).
+
+## Snowflake's Approach
+
+Snowflake extended standard SQL para include **purpose-built semi-structured data types**. Permiten store semi-structured data inside relational table. Semi-structured data types pueden hold complex/variable structures (arrays, objects) en table column. Existen alongside standard data types (string, date, numeric) en one table → possible combine structured y semi-structured data en single query.
+
+Snowflake también extended SQL para include **semi-structured functions y notation** para access data stored en esos types.
+
+### Semi-Structured Data Types
+
+**1. ARRAY:**
+- Own data type, collection holding zero o más elements de data
+- Cada element puede ser different data type
+- Accessed por position en array
+- Can specify como type de column en table
+- Crear con `ARRAY_CONSTRUCT()` function
+- Access elements: `array_column[position]`
+
+**2. OBJECT:**
+- Analogous a JSON object: collection de key-value pairs
+- Crear con `OBJECT_CONSTRUCT()` function
+- Store complex data structure (keys + values) en one column
+- Interact usando notations añadidas por Snowflake a SQL
+
+**3. VARIANT:**
+- **Universal semi-structured data type**
+- Puede hold **any other data type:** objects, arrays, numbers, anything
+- Objects y arrays son really just restrictions de variant type
+- **Primary use:** Storing whole semi-structured data files (ej: entire JSON/Parquet document en variant column, o split elements en separate rows during loading)
+- Puede hold hasta **16 MB compressed data per row** (si large file exceeds threshold → error thrown. Soluciones: split JSON file prior to loading o usar file format option para separate JSON objects en file para load como separate rows)
+
+### Natively Supported Semi-Structured File Formats
+
+**Snowflake natively supports:**
+- **JSON:** Popular plain text format based en subset de JavaScript programming language
+- **Avro:** Open source framework originally developed para Apache Hadoop. Stores data definition en JSON format (easy read/interpret). Data stored en binary format (compact/efficient)
+- **ORC:** Binary format usado para store Hive data
+- **Parquet:** Binary format designed para projects en Hadoop ecosystem
+- **XML:** Consisting primarily de tags y elements
+
+**Unloading:** Solo **JSON y Parquet** pueden unloaded usando COPY INTO location command.
+
+**Native support meaning:** Snowflake figured out way para load estos formats en storage, intelligently extracting columns from complex structures y transforming en Snowflake's columnar file format.
+
+## Loading Semi-Structured Data
+
+Data loading process **broadly same** para structured y semi-structured data: files uploaded a stage → COPY INTO command executed (by user o vía Snowpipe) para move stage files en table storage.
+
+### Process Details
+
+Cuando loading any semi-structured data formats, files undergo very similar process como structured data (CSV):
+- **Repeating attributes** (ej: keys en JSON) automáticamente identified y extracted en columnar format
+- **Rules que prevent extraction:** Value para repeating key tiene different data types between elements, elements tienen string value de null
+
+**Despite limitations:** Query performance comparable entre semi-structured data types (variant) y standard data types.
+
+**Additional processes:** Extracting columns en columnar format + familiar processes: splitting input data en micro-partitions, compression, encryption, gathering statistics.
+
+### File Format Objects
+
+Like structured data, **file format type must match files en stage** para que Snowflake sepa qué parse. Cada supported semi-structured format uniquely structured (some binary, some plain text). Por esto, cada file format object para cada type (JSON, ORC, etc.) tiene own set de options (como CSV file format).
+
+Puede apply file format a: stage, COPY INTO table command, o table itself. Typically found en stage o COPY INTO table command.
+
+**JSON File Format Properties examples:**
+- **COMPRESSION:** Usado cuando loading data, configure qué compression algorithm used para extract during loading
+- **STRIP_OUTER_ARRAY:** Important option, convenient way para bypass 16 MB limit en variant column durante loading. Top-level elements en JSON file generally listed en array. Property removes outer array y considers cada top-level element en file como own row en table
+
+## Three Main Loading Approaches
+
+### 1. ELT (Extract, Load, Transform)
+
+Load entire semi-structured data file directly en **single variant column** vía COPY INTO table command. Shows power de variant data type: allows **schemaless storage** de hierarchical data en table.
+
+**Idea:** Load file → later query usando semi-structured SQL extensions O pick out columns from variant column y load en new table.
+
+**When to use:** Structure o operations on data **not known upfront**.
+
+**Según Snowflake:** Typically tables para store semi-structured data consist de **single variant column** (common loading pattern expected).
+
+**Under the hood:** Optimizations around column extraction y compression transparently happening para make querying complex hierarchical data quicker.
+
+### 2. ETL (Extract, Transform, Load)
+
+Pick out column values directly from semi-structured data files upfront. Similar a extraction de columns from CSV pero usando **semi-structured SQL extensions**. Notation slightly different entre semi-structured formats por how organized internally.
+
+**Benefits:**
+- Values como dates/timestamps stored como **strings** cuando loaded en variant column. ETL approach separating en columns permite store como **native data types** → improves pruning y decreases storage consumption
+
+### 3. Automatic Schema Detection
+
+**INFER_SCHEMA table function:** Detects column definitions en set de staged data files. Output puede passed a `USING TEMPLATE` en CREATE TABLE DDL para define columns.
+
+**MATCH_BY_COLUMN_NAME:** Option para COPY INTO command. Match columns en semi-structured data file a corresponding columns en table during loading, **without manually specifying** cada element (como en ETL approach). **Tricky en practice:** Column names en data file need match exactly column naming convention en Snowflake. Puede match con case sensitivity o without.
+
+## Unloading Semi-Structured Data
+
+Works much same way como structured data:
+1. Execute COPY INTO location command para copy data from table/query en stage as file
+2. Followed por GET command para download data a local machine
+
+Puede apply file format a: COPY INTO statement, stage, o table definition.
+
+**Limitation:** Solo **JSON y Parquet** pueden unloaded a stage.
+
+## Querying Semi-Structured Data
+
+Assume ELT approach usado (loaded JSON document en single variant column). ¿Cómo query y extract nested elements?
+
+**Variant type:** Exposes semi-structured data en **native form** (when query variant column, ves essentially same structure como prior to ingestion). Behind scenes: Snowflake storing en **columnar form** (more performant para query).
+
+### Dos Métodos para Traverse Semi-Structured Data
+
+**1. Dot Notation:**
+- Colon `:` placed after variant column name para extract first-level element
+- Subsequent elements accessed con dot `.`
+- Syntax: `variant_column:first_level.child_object`
+- Column name **case insensitive** (like all SQL columns), pero element names **case sensitive**
+
+**2. Bracket Notation:**
+- More akin a high-level programming languages
+- Variant column name followed por square brackets enclosing element names
+- Syntax: `variant_column['first_level']['child_object']`
+- Same case rules apply
+
+**Accessing array element:**
+```sql
+variant_column:element[integer_position]
+```
+Extrae single element from array (position-based).
+
+**GET Function:** NOT confused con GET command (used para unload data). Function allows perform same task como dot/bracket notation, accessing repeating elements en form de function call.
+
+### Casting
+
+**Issue:** Si uncast, output de select statements será type variant y **enclosed en double quotes**.
+
+**JSON data types mapping:** JSON puede represent: string literals, integers, arrays, objects, Booleans, null values. Snowflake maps JSON data types a SQL data types. Number, Boolean, null displayed accurately. **Pero string literal values** retornan como string literal (sequence de characters enclosed en double quotes), no string como expected. JSON no representa dates → también true para date columns.
+
+**Important:** Considerarlo cuando comparing structured y semi-structured columns (ej: join between tables - joindría con double quotes included).
+
+**Best practice:** **Explicitly cast results** from variant column.
+
+**Three casting methods:**
+
+**1. Double colon notation (shorthand):**
+```sql
+variant_column:element::DATE
+```
+
+**2. TO_<datatype> function:**
+```sql
+TO_DATE(variant_column:element)
+```
+
+**3. AS_<datatype> function:**
+```sql
+AS_DATE(variant_column:element)
+```
+Solo used para converting values **from variant column**.
+
+**Opposite operation:** También puede cast from data types (integer, string) **to variant**.
+
+## Semi-Structured Functions
+
+### FLATTEN Table Function
+
+Takes nested data structure y **explodes/flattens** it → produces row para cada item en nested structure.
+
+**Required parameter:** `INPUT` (thing to flatten - must be variant, object o array data type)
+
+**Wrap en TABLE() function:** Para interact con results de flatten function como si fuera table de columns.
+
+**Optional parameters:**
+- **PATH:** Specify path inside object to flatten (no flatten whole thing, take specific value como array)
+- **RECURSIVE (Boolean):** Determina si flatten performed en sub-elements además de top-level provided como input
+
+**Output columns (6 total):**
+1. **SEQ:** Unique sequence number associated con input record (not guaranteed gap-free o ordered)
+2. **KEY:** Si exploding object, holds key de object. Si array → null
+3. **PATH:** Path a element dentro data structure being flattened
+4. **INDEX:** Si array, holds position de element
+5. **VALUE:** **Generally what we want to select.** Contains value de element de flattened array/object
+6. **THIS:** Contains element being flattened (useful en recursive flattening)
+
+### LATERAL FLATTEN
+
+Combination de **lateral join** + **flatten function**. Puede ser complicated.
+
+**Purpose:** Normalize table flattening values (ej: skills array). Flatten array duplicating other column values from table para create multiple rows.
+
+**How it works:**
+1. **LATERAL join** hands cada row de table (could be view/subquery) a flatten table function
+2. From row passed, select thing to flatten (ej: skills array)
+3. Associates output de flatten function con row from base table
+4. Can select from both base table Y output de flatten function → present nested data alongside other columns
+
+**Use case:** Violates first normal form (contains composite/multi-value attribute) → lateral flatten normalizes.
