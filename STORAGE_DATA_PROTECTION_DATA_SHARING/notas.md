@@ -159,3 +159,166 @@ Cuando table/schema/database dropped, kept por duration de configured retention 
 **Applies to:** **Permanent objects only** (not transient/temporary).
 
 **Storage costs:** Data en fail-safe Y time travel both **contribute to data storage costs**.
+
+
+## Cloning
+
+### Concepto General
+
+**Cloning:** Process de creating copy de existing object dentro Snowflake account.
+
+**Syntax básico:** 
+```sql
+CREATE TABLE clone_name CLONE source_table;
+```
+
+Provide identifier para clone + keyword `CLONE` + identifier de source object to clone.
+
+### Objects que Pueden Clonarse
+
+**Direct cloning (usando CLONE keyword):**
+- Tables
+- Streams
+- Stages
+- File formats
+- Sequences
+- Tasks
+- Pipes (limitación: solo pipes referencing **external stage** pueden clonarse, not internal stage)
+
+**Recursive cloning (databases y schemas):**
+
+Cloning containers es **recursive** y could include objects que **can't be directly cloned** usando CLONE keyword. Example: clone schema con view en él → cloned schema también contains view, despite fact you can't directly clone view.
+
+**Never cloned:** External tables, internal named stages.
+
+### Zero-Copy Cloning
+
+**Metadata-only operation:** Copies properties y structure de source object. Simpler objects (ej: file formats) just named wrappers para properties.
+
+**Objects managing micro-partitions (ej: tables):**
+
+Execute CLONE command en table → **NOT actually copying data files** de source table. Making identical **metadata version** de object que **points to source table's micro-partitions**. Really not duplicating any data → **cloning does NOT contribute to storage costs** hasta data modified o new data added to clone.
+
+**Funcionamiento visualizado:**
+
+1. **Initial state:** Clone initially just points a existing micro-partitions de source table
+2. **Query clone:** Returns results pulled from source table's micro-partitions (identical en structure/data)
+3. **Changes to clone:** Inserting new rows after cloning → start creating **additional micro-partitions** under clone (estos incur additional storage cost)
+4. **Result:** Clone table ends up con mixture de **shared micro-partitions** (original) + **independent micro-partitions** (new)
+
+**Independence:** Changes made to source o clone **NOT reflected** entre each other. Completely independent objects.
+
+**Cloning cloned objects:** Puede clone already cloned object con nearly no limits.
+
+**Speed:** Process not instant (depends on qué cloning) pero very quick. Allows rapidly create clone (particularly good para testing purposes - ej: quickly get copy from live environment para perform integration tests).
+
+### Caveats al Usar Cloning
+
+❌ **Privileges:** Cloned object **does NOT retain granted privileges** from source object sin specify additional command `COPY GRANTS`. **Exception:** Tables. SYSADMIN o owner de cloned object puede manually grant privileges to clone after created.
+
+❌ **Recursive cloning rules:** Cloning database clones all schemas/tables + other objects (views, pipes, stages, etc.). Cada tiene own specific rules. Example: pipe cloned como part de clone database command solo copies pipes referencing **external stage** (not internal).
+
+❌ **Load history:** Clone table **does NOT contain load history** de source table (no memory de qué files uploaded para make source table). Could lead to situation donde duplicate data ingested en clone.
+
+❌ **Table type restrictions:** 
+- Temporary/transient tables solo pueden cloned como temporary/transient tables (not permanent)
+- Permanent tables pueden cloned como temporary, transient, O permanent
+
+### Cloning con Time Travel
+
+Possible combine time travel + cloning para create table/schema/database/stream clone from **point en past** dentro object's retention period.
+
+**Syntax:** Use `AT` clause (o `BEFORE` clause):
+```sql
+CREATE TABLE clone_name CLONE source_table AT (TIMESTAMP => '2024-01-01 12:00:00');
+```
+
+**Error condition:** Si source object didn't exist at time specified en AT/BEFORE parameter → error thrown.
+
+## Replication vs Cloning
+
+### Replication
+
+**Definition:** Feature enabling replicating databases **between Snowflake accounts** dentro single organization.
+
+**Typical use:** Ensure business continuity y disaster recovery si entire cloud provider region goes down (outage).
+
+### Key Differences
+
+| Aspecto | Replication | Cloning |
+|---------|-------------|---------|
+| **Scope** | Between accounts dentro organization | Within one account |
+| **Data movement** | Data **physically moved** | Cloned object solo **references underlying storage vía metadata** |
+
+### Setup de Replication
+
+**Prerequisites:**
+- Organization feature enabled para account
+- User con ORGADMIN role
+
+**Steps:**
+
+**1. Enable replication:** Set account parameter `ENABLE_ACCOUNT_DATABASE_REPLICATION = TRUE` para each source y target accounts. Si no tienes organization feature enabled → contact Snowflake Support.
+
+**2. Select primary database:** En source account.
+
+**3. Create secondary database:** En target account como replica de primary database. Read-only replica. Running command kicks off initial process para transfer database objects + data a secondary database.
+
+**4. Periodic refresh:** Secondary databases pueden refreshed periodically con snapshot de primary database, replicating all data + DDL operations en database objects.
+
+### Additional Information
+
+❌ **Not replicated:** Algunos database objects currently no replicated (includes external tables).
+
+✅ **Automation:** Command para perform incremental refresh de secondary database puede automated configurando task para run refresh command en schedule.
+
+❌ **Refresh operation fails:** Si primary database contains event o external table type.
+
+❌ **Privileges:** Granted privileges a database objects **NOT replicated** to secondary database.
+
+**Billing:** Based en:
+- **Data transfer:** Initial database replication + subsequent synchronization operations transfer data between regions (cloud providers charge for this)
+- **Compute resources:** Snowflake resources required para copy data between accounts
+
+## Storage Billing
+
+### Qué se Billa
+
+Data storage cost calculated **monthly** based en average number de **on-disk bytes** para all data stored each day en Snowflake account.
+
+**"All data" refers to dos areas:**
+
+**1. Database Table Data:** Comprises data from each step en data lifecycle:
+- Most current up-to-date micro-partitions
+- Older versions de micro-partitions (enabling Time Travel)
+- Micro-partitions Snowflake maintained para enable Fail-Safe
+
+**All contribute to cost.** 90-day retention period en all tables = powerful data recovery capabilities pero potentially greatly increase billing amount. Weighing pros/cons when toggling retention period.
+
+**2. Internal Stage:** Anything stored en internal stages contributes to storage costs. Unlike table data, we decide how files look en stages (ej: upload very large uncompressed file y forget delete → contributes to storage billing).
+
+### Cómo se Calcula
+
+**Problema:** Can add/remove data at any point durante billing window.
+
+**Snowflake's calculation:**
+1. **Daily average:** Calculate every 24 hours average amount de data stored en dos areas
+2. **Monthly average:** At end de month, take another average across all days en month
+3. **Billing:** Figure billed based en **flat rate per terabyte**
+
+**Rate variation:** Amount charged per TB varies based en:
+- Region
+- Purchasing plan (Capacity vs On-Demand)
+
+**Example rate:** On-Demand plan, AWS London Region = $42 USD per TB.
+
+### Examples de Calculation
+
+Using Snowflake's Credit Consumption Table document (contains subset de cloud providers' regions + respective TB/month cost). Amount (USD) affected por:
+- Cloud provider (AWS, Azure, GCP)
+- Region
+- Pricing plan (On-Demand vs Capacity)
+
+**Example 1:** Average 15 TB stored durante month, account deployed en AWS London Region = **$630** (as of November 2021).
+
+**Example 2:** Average 14 TB stored durante billing month, account deployed en AWS AP Mumbai Region = **$644**. Billed more money para less data purely por being en different region.
